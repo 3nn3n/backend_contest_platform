@@ -1,8 +1,8 @@
 import express from "express"
+import axios from "axios";
 import { success } from "../utils/response.js";
 import { failure } from "../utils/response.js";
 import {pool} from "../db/index.js";
-import jwt from "jsonwebtoken";
 import { authenticateToken } from "../middleware/auth.js";
 import { authorizeRoles } from "../middleware/role.js";
 
@@ -144,7 +144,8 @@ router.post("/:contestId/dsa", authenticateToken, authorizeRoles('creator'), asy
 
     const newDsaProblem = dsaProblem.rows[0];
 
-    // Insert test cases
+    // Inserting test cases into test_cases table
+    // linked to the newly created DSA problem via problem_id foreign key and collecting the inserted test cases to return in the response
     const insertedTestCases = [];
     for (const testCase of testCases) {
       const { input, expectedOutput, isHidden } = testCase;
@@ -183,4 +184,277 @@ router.post("/:contestId/dsa", authenticateToken, authorizeRoles('creator'), asy
   }
 });
 
+router.get("/problems/:problemId", authenticateToken, async (req, res) => {
+  try {
+    const { problemId } = req.params;
+
+    const dsaProblemQuery = await pool.query(
+      'SELECT id, contest_id, title, description, tags, points, time_limit, memory_limit FROM dsa_problems WHERE id = $1',
+      [problemId]
+    );
+    if (dsaProblemQuery.rows.length === 0) {
+      return failure(res, 404, "DSA problem not found");
+    }
+    const dsaProblem = dsaProblemQuery.rows[0];
+    const testCasesQuery = await pool.query(
+      'SELECT id, input, expected_output, is_hidden FROM test_cases WHERE problem_id = $1 AND is_hidden = false',
+      [problemId]
+    );
+    const testCases = testCasesQuery.rows;
+
+    return success(res, {
+      id: dsaProblem.id,
+      contestId: dsaProblem.contest_id,
+      title: dsaProblem.title,
+      description: dsaProblem.description,
+      tags: dsaProblem.tags,
+      points: dsaProblem.points,
+      timeLimit: dsaProblem.time_limit,
+      memoryLimit: dsaProblem.memory_limit,
+      visibleTestCases: testCases.map(tc => ({
+        id: tc.id,
+        input: tc.input,
+        expectedOutput: tc.expected_output,
+        isHidden: tc.is_hidden
+      }))
+    });
+  }
+  catch (err) {
+    console.error("Get DSA problem error", err);
+    return failure(res, 500, "internal server error");
+  }
+});
+
+router.post("/:contestId/mcq/:questionId/submit", 
+  authenticateToken, 
+  authorizeRoles('contestant'), 
+  async (req, res) => {
+    try {
+      const { contestId, questionId } = req.params;
+      const { selectedOptionIndex } = req.body;
+      const userId = req.user.id;
+
+      if(!contestId || !questionId) {
+        return failure(res, 400, "wrong contestId or questionId");
+      }
+
+      if (selectedOptionIndex === undefined) {
+        return failure(res, 400, "selectedOptionIndex is required");
+      }
+
+      const questionQuery = await pool.query(
+        'SELECT * FROM mcq_questions WHERE id = $1 AND contest_id = $2',
+        [questionId, contestId]
+      );
+      if (questionQuery.rows.length === 0) {
+        return failure(res, 404, "MCQ question not found for this contest");
+      }
+      const question = questionQuery.rows[0];
+      const isCorrect = question.correct_option === selectedOptionIndex;
+      const pointsEarned = isCorrect ? 1 : 0;
+
+      const submission = await pool.query(
+        'INSERT INTO mcq_submissions (user_id, question_id, selected_option_index, is_correct, points_earned) VALUES ($1, $2, $3, $4, $5) RETURNING id, user_id, question_id, selected_option_index, is_correct, points_earned',
+        [userId, questionId, selectedOptionIndex, isCorrect, pointsEarned]
+      );
+      const newSubmission = submission.rows[0];
+
+      return success(res, {
+        isCorrect: newSubmission.is_correct,
+        pointsEarned: newSubmission.points_earned
+      });
+
+    } catch (err) {
+      console.error("Submit MCQ answer error", err);
+      return failure(res, 500, "Internal Server Error");
+    }
+  });
+
+  router.post("/problems/:problemId/submit", 
+    authenticateToken, 
+    authorizeRoles('contestant'),
+    async (req, res) => {
+      try {
+        const { problemId } = req.params;
+        const { code, languageId } = req.body;
+        const userId = req.user.id;
+
+        if (!code || !languageId) {
+          return failure(res, 400, "code and languageId are required");
+        }
+
+        // Get problem and test cases
+        const problemQuery = await pool.query(
+          'SELECT * FROM dsa_problems WHERE id = $1',
+          [problemId]
+        );
+        if (problemQuery.rows.length === 0) {
+          return failure(res, 404, "DSA Problem not found");
+        }
+        const problem = problemQuery.rows[0];
+
+        const testCasesQuery = await pool.query(
+          'SELECT * FROM test_cases WHERE problem_id = $1',
+          [problemId]
+        );
+        const testCases = testCasesQuery.rows;
+
+        if (testCases.length === 0) {
+          return failure(res, 400, "No test cases found for this problem");
+        }
+
+        // Submit to Judge0 for each test case
+        let passedTests = 0;
+        let totalTests = testCases.length;
+        let status = 'Accepted';
+
+        for (const testCase of testCases) {
+          try {
+            // Create submission
+            const submissionResponse = await axios.post(
+              `${process.env.JUDGE0_API_URL}/submissions`,
+              {
+                source_code: code,
+                language_id: languageId,
+                stdin: testCase.input,
+                expected_output: testCase.expected_output
+              },
+              {
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
+                  'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+                }
+              }
+            );
+
+            const token = submissionResponse.data.token;
+
+            // Wait and get result
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            const resultResponse = await axios.get(
+              `${process.env.JUDGE0_API_URL}/submissions/${token}`,
+              {
+                headers: {
+                  'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
+                  'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com'
+                }
+              }
+            );
+
+            const result = resultResponse.data;
+
+            // Check if test passed (status_id 3 = Accepted)
+            if (result.status.id === 3) {
+              passedTests++;
+            } else {
+              status = result.status.description || 'Wrong Answer';
+            }
+          } catch (judgeError) {
+            console.error('Judge0 API error:', judgeError);
+            status = 'Runtime Error';
+          }
+        }
+
+        // Calculate points
+        const pointsEarned = passedTests === totalTests ? problem.points : 0;
+        if (passedTests !== totalTests) {
+          status = 'Wrong Answer';
+        }
+
+        // Save submission to database
+        const submission = await pool.query(
+          'INSERT INTO dsa_submissions (user_id, problem_id, code, language, status, points_earned, test_cases_passed, total_test_cases) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, status, points_earned, test_cases_passed, total_test_cases',
+          [userId, problemId, code, languageId.toString(), status, pointsEarned, passedTests, totalTests]
+        );
+
+        const newSubmission = submission.rows[0];
+
+        return success(res, {
+          status: newSubmission.status,
+          pointsEarned: newSubmission.points_earned,
+          testCasesPassed: newSubmission.test_cases_passed,
+          totalTestCases: newSubmission.total_test_cases
+        });
+
+      } catch (err) {
+        console.error("Submit DSA solution error", err);
+        return failure(res, 500, "Internal Server Error");
+      }
+    });
+
+  router.get("/contests/:contestId/leaderboard", 
+    authenticateToken, 
+    async (req, res) => {
+      try {
+        const { contestId } = req.params;
+
+        if (!contestId) {
+          return failure(res, 400, "contestId is required");
+        }
+
+        const leaderboardQuery = await pool.query(
+          `WITH mcq_points AS (
+            SELECT 
+              mcq.user_id,
+              COALESCE(SUM(mcq.points_earned), 0) AS mcq_total
+            FROM mcq_submissions mcq
+            INNER JOIN mcq_questions mq ON mcq.question_id = mq.id
+            WHERE mq.contest_id = $1
+            GROUP BY mcq.user_id
+          ),
+          dsa_best_points AS (
+            SELECT 
+              dsa.user_id,
+              dsa.problem_id,
+              MAX(dsa.points_earned) AS best_points
+            FROM dsa_submissions dsa
+            INNER JOIN dsa_problems dp ON dsa.problem_id = dp.id
+            WHERE dp.contest_id = $1
+            GROUP BY dsa.user_id, dsa.problem_id
+          ),
+          dsa_totals AS (
+            SELECT 
+              user_id,
+              COALESCE(SUM(best_points), 0) AS dsa_total
+            FROM dsa_best_points
+            GROUP BY user_id
+          ),
+          user_scores AS (
+            SELECT 
+              u.id AS user_id,
+              u.name AS username,
+              COALESCE(mcq.mcq_total, 0) + COALESCE(dsa.dsa_total, 0) AS total_points
+            FROM users u
+            LEFT JOIN mcq_points mcq ON u.id = mcq.user_id
+            LEFT JOIN dsa_totals dsa ON u.id = dsa.user_id
+            WHERE COALESCE(mcq.mcq_total, 0) + COALESCE(dsa.dsa_total, 0) > 0
+          )
+          SELECT 
+            user_id,
+            username,
+            total_points,
+            DENSE_RANK() OVER (ORDER BY total_points DESC) AS rank
+          FROM user_scores
+          ORDER BY total_points DESC, username ASC`,
+          [contestId]
+        );
+
+        const leaderboard = leaderboardQuery.rows.map(row => ({
+          userId: row.user_id,
+          username: row.username,
+          totalPoints: parseInt(row.total_points, 10),
+          rank: parseInt(row.rank, 10)
+        }));
+
+        return success(res, { leaderboard });
+      }
+      catch (err) {
+        console.error("Get leaderboard error", err);
+        return failure(res, 500, "internal server error");
+      }
+  });
+
 export default router
+

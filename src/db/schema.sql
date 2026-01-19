@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS test_cases (
 CREATE TABLE IF NOT EXISTS mcq_submissions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  question_id UUID REFERENCES dsa_problems(id) ON DELETE CASCADE,
+  question_id UUID REFERENCES mcq_questions(id) ON DELETE CASCADE,
   selected_option_index INT NOT NULL,
   is_correct BOOLEAN NOT NULL,
   points_earned INT DEFAULT 0,
