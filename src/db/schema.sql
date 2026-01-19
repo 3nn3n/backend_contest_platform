@@ -34,10 +34,11 @@ CREATE TABLE IF NOT EXISTS dsa_problems (
   contest_id UUID REFERENCES contests(id) ON DELETE CASCADE,
   title VARCHAR(200) NOT NULL,
   description TEXT NOT NULL,
-  tags JSONB,
+  tags JSONB[],
   points INT NOT NULL DEFAULT 100,
   time_limit INT NOT NULL DEFAULT 2000,
   memory_limit INT NOT NULL DEFAULT 256,
+  test_cases JSONB[],
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 

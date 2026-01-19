@@ -1,4 +1,4 @@
-import { failure } from "../utils/response"
+import { failure } from "../utils/response.js"
 
 export function authorizeRoles(role) {
   return (req, res, next) => {
